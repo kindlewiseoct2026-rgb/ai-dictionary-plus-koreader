@@ -1,0 +1,165 @@
+local InputContainer = require("ui/widget/container/inputcontainer")
+
+local Actions = require("actions")
+local Context = require("context")
+local Config = require("configuration_manager")
+local ErrorBoundary = require("error_boundary")
+local BookSetting = require("word_sense_book")
+local LongPress = require("long_press")
+local LookupsReportUI = require("lookups_report_ui")
+local QuerySession = require("query_session")
+local SettingsMenu = require("settings_menu")
+local Updater = require("updater")
+
+local Benedict = InputContainer:new {
+  name = "benedict",
+  is_doc_only = true,
+}
+
+function Benedict:Query(reader_highlight_instance, dialog_title, preface_with_selection, query)
+  return ErrorBoundary.call("query", QuerySession.query,
+    self, reader_highlight_instance, dialog_title, preface_with_selection, query)
+end
+
+function Benedict:Regenerate(chatgpt_viewer)
+  return ErrorBoundary.call("regenerate", QuerySession.regenerate, self, chatgpt_viewer)
+end
+
+function Benedict:getCurrentChapterName()
+  return ErrorBoundary.call("get current chapter", Context.get_current_chapter_name, self)
+end
+
+function Benedict:showLookupsReportRequestDialog(selected_index)
+  return ErrorBoundary.call("show lookups report dialog", LookupsReportUI.show_request_dialog, self, selected_index)
+end
+
+function Benedict:showLookupsReportTimeframeDialog(selected_index)
+  return ErrorBoundary.call("show report timeframe dialog", LookupsReportUI.show_timeframe_dialog, self, selected_index)
+end
+
+function Benedict:generateLookupsReport(timeframe)
+  return ErrorBoundary.call("generate lookups report", LookupsReportUI.generate, self, timeframe)
+end
+
+function Benedict:getSettingsMenuItems()
+  return ErrorBoundary.call("build settings menu", SettingsMenu.get_items, self)
+end
+
+function Benedict:saveConfiguration(configuration)
+  local saved = ErrorBoundary.call("save configuration", SettingsMenu.save_configuration, self, configuration)
+  if saved then self:updateWordSense() end
+  return saved
+end
+
+function Benedict:updateWordSense()
+  ErrorBoundary.call("update Word Sense settings", function()
+    if not BookSetting.enabled(self.ui) then
+      self:onCloseDocument()
+    elseif self.word_sense then
+      self.word_sense:settings_changed()
+    else
+      self.word_sense = require("word_sense").new(self)
+      if self.word_sense then self.word_sense:refresh() end
+    end
+  end)
+end
+
+function Benedict:editConfigurationValue(key, parse_as_literal)
+  return ErrorBoundary.call("edit configuration", SettingsMenu.edit_configuration_value, self, key, parse_as_literal)
+end
+
+function Benedict:addConfigurationValue()
+  return ErrorBoundary.call("add configuration value", SettingsMenu.add_configuration_value, self)
+end
+
+function Benedict:editNewConfigurationLiteral(key)
+  return ErrorBoundary.call("edit new configuration value", SettingsMenu.edit_new_configuration_literal, self, key)
+end
+
+function Benedict:checkForUpdates()
+  if not self.updater then
+    self.updater = Updater:new(self)
+  end
+  return ErrorBoundary.call("manual update check", self.updater.checkManually, self.updater)
+end
+
+function Benedict:addToMainMenu(menu_items)
+  return ErrorBoundary.call("build main menu", function()
+    menu_items.ai_dictionary_lookups_report = {
+      text = "AI Dictionary Lookups Report",
+      sorting_hint = "search",
+      callback = ErrorBoundary.wrap("open lookups report", function()
+        self:showLookupsReportRequestDialog()
+      end),
+    }
+    menu_items.ai_dictionary_settings = {
+      text = "AI Dictionary settings",
+      sorting_hint = "more_tools",
+      sub_item_table_func = function()
+        return self:getSettingsMenuItems()
+      end,
+    }
+  end)
+end
+
+function Benedict:init()
+  if self.ui and self.ui.menu then
+    ErrorBoundary.call("main menu registration", function()
+      self.ui.menu:registerToMainMenu(self)
+    end)
+  end
+
+  ErrorBoundary.call("updater setup", function()
+    self.updater = Updater:new(self)
+    if Config.is_update_check_enabled() then
+      self.updater:checkOnStartup()
+    end
+  end)
+
+  if self.ui and self.ui.highlight then
+    ErrorBoundary.call("highlight action registration", Actions.register, self)
+    ErrorBoundary.call("long-press action registration", LongPress.register, self)
+  end
+end
+
+function Benedict:onReaderReady()
+  self:onCloseDocument()
+  self:updateWordSense()
+end
+
+function Benedict:onPageUpdate()
+  if self.word_sense then
+    ErrorBoundary.call("update Word Sense page", self.word_sense.refresh, self.word_sense)
+  end
+end
+
+Benedict.onPosUpdate = Benedict.onPageUpdate
+
+function Benedict:onDocumentRerendered()
+  if self.word_sense then
+    ErrorBoundary.call("refresh Word Sense layout", self.word_sense.layout_changed, self.word_sense)
+  end
+end
+
+Benedict.onSetDimensions = Benedict.onDocumentRerendered
+
+function Benedict:onSuspend()
+  if self.word_sense then
+    ErrorBoundary.call("suspend Word Sense", self.word_sense.suspend, self.word_sense)
+  end
+end
+
+function Benedict:onResume()
+  if self.word_sense then
+    ErrorBoundary.call("resume Word Sense", self.word_sense.resume, self.word_sense)
+  end
+end
+
+function Benedict:onCloseDocument()
+  if self.word_sense then
+    ErrorBoundary.call("close Word Sense", self.word_sense.close, self.word_sense)
+    self.word_sense = nil
+  end
+end
+
+return Benedict

@@ -1,0 +1,311 @@
+local ConfigurationManager = {}
+local Parameters = require("request_parameters")
+
+ConfigurationManager.CORE_CONFIGURATION_KEYS = {
+  "update_check",
+  "output_language",
+  "images",
+  "api_key",
+  "text_endpoint",
+  "text_model",
+  "dictionary_model",
+  "dictionary_reasoning_effort",
+  "explain_model",
+  "explain_reasoning_effort",
+  "word_sense_whole_book",
+  "word_sense_level",
+  "word_sense_model",
+  "word_sense_reasoning_effort",
+  "debug_mode",
+}
+
+ConfigurationManager.CORE_CONFIGURATION_KEY_SET = {}
+for _, key in ipairs(ConfigurationManager.CORE_CONFIGURATION_KEYS) do
+  ConfigurationManager.CORE_CONFIGURATION_KEY_SET[key] = true
+end
+
+ConfigurationManager.CONFIG_ONLY_CONFIGURATION_KEYS = {}
+for _, feature in ipairs(Parameters.FEATURES) do
+  ConfigurationManager.CONFIG_ONLY_CONFIGURATION_KEYS[feature .. "_parameters_json"] = true
+end
+
+ConfigurationManager.BOOLEAN_CONFIGURATION_KEYS = {
+  word_sense_whole_book = true,
+  debug_mode = true,
+  images = true,
+  update_check = true,
+}
+
+ConfigurationManager.DEPRECATED_CONFIGURATION_KEYS = {
+  word_sense_active = true, -- now a per-book setting
+  provider = true,
+  model = true,
+  voice_api_key = true,
+  voice_provider = true,
+  word_wise_level = true,
+  word_wise_model = true,
+}
+
+ConfigurationManager.CONFIGURATION_LABELS = {
+  update_check = "Auto-check for updates:",
+  api_key = "API key",
+  text_endpoint = "Text endpoint URL",
+  text_model = "Default text model",
+  dictionary_model = "Dictionary / Simplify model",
+  dictionary_reasoning_effort = "Dictionary / Simplify reasoning effort",
+  explain_model = "Explain / Report model",
+  explain_reasoning_effort = "Explain / Report reasoning effort",
+  output_language = "Output language",
+  word_sense_whole_book = "Word Sense: process whole book for offline use",
+  word_sense_level = "Word Sense reading level",
+  word_sense_model = "Word Sense model",
+  word_sense_reasoning_effort = "Word Sense reasoning effort",
+  additional_parameters = "Additional parameters",
+  images = "Show images",
+  debug_mode = "Debug mode",
+}
+
+function ConfigurationManager.get_configuration_path(plugin)
+  local base_path = plugin and plugin.path
+  if base_path and base_path ~= "" then
+    return base_path .. "/configuration.lua"
+  end
+  return "AI_Dictionary_Plus.koplugin/configuration.lua"
+end
+
+function ConfigurationManager.normalize(configuration)
+  if configuration.text_endpoint == nil then
+    configuration.text_endpoint = configuration.provider
+  end
+  if configuration.text_model == nil then
+    configuration.text_model = configuration.model
+  end
+  if configuration.update_check == nil then
+    configuration.update_check = true
+  end
+  if configuration.images == nil then
+    configuration.images = true
+  end
+  if type(configuration.output_language) ~= "string"
+      or configuration.output_language:match("^%s*$")
+      or configuration.output_language:find("[%c\r\n]")
+      or #configuration.output_language > 60 then
+    configuration.output_language = "English"
+  else
+    configuration.output_language = configuration.output_language:match("^%s*(.-)%s*$")
+  end
+  -- The whole-book background pass is on unless explicitly disabled.
+  configuration.word_sense_whole_book = configuration.word_sense_whole_book ~= false
+  local level = configuration.word_sense_level
+  if level ~= "Basic" and level ~= "Intermediate" and level ~= "Advanced" then
+    configuration.word_sense_level = "Intermediate"
+  end
+  for _, feature in ipairs(Parameters.FEATURES) do
+    for _, suffix in ipairs({ "_model", "_reasoning_effort" }) do
+      local key = feature .. suffix
+      local value = configuration[key]
+      value = type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
+      configuration[key] = value:find("%c") and "" or value
+    end
+    local key = feature .. "_parameters_json"
+    if configuration[key] == nil then configuration[key] = "" end
+  end
+  return configuration
+end
+
+function ConfigurationManager.load()
+  package.loaded["configuration"] = nil
+  local ok, config = pcall(function() return require("configuration") end)
+  if ok and type(config) == "table" then
+    return ConfigurationManager.normalize(config)
+  end
+  return ConfigurationManager.normalize({
+    api_key = "",
+    text_endpoint = "https://api.openai.com/v1/chat/completions",
+    text_model = "gpt-5-nano",
+    output_language = "English",
+    images = true,
+    update_check = true,
+  })
+end
+
+function ConfigurationManager.is_debug_mode_enabled()
+  local configuration = ConfigurationManager.load()
+  return configuration and configuration.debug_mode == true
+end
+
+function ConfigurationManager.is_update_check_enabled()
+  local configuration = ConfigurationManager.load()
+  return not configuration or configuration.update_check ~= false
+end
+
+function ConfigurationManager.is_images_enabled()
+  local configuration = ConfigurationManager.load()
+  return not configuration or configuration.images ~= false
+end
+
+function ConfigurationManager.get_output_language()
+  return ConfigurationManager.load().output_language or "English"
+end
+
+function ConfigurationManager.is_english_output()
+  local language = ConfigurationManager.get_output_language():lower()
+  return language == "english" or language == "en" or language == "en-us" or language == "en-gb"
+end
+
+local function is_array(value)
+  if type(value) ~= "table" then
+    return false
+  end
+
+  local count = 0
+  for key, _ in pairs(value) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+      return false
+    end
+    count = count + 1
+  end
+  return count == #value
+end
+
+function ConfigurationManager.is_lua_identifier(value)
+  return type(value) == "string" and value:match("^[A-Za-z_][A-Za-z0-9_]*$") ~= nil
+end
+
+function ConfigurationManager.serialize_lua_value(value, indent)
+  indent = indent or ""
+  local value_type = type(value)
+
+  if value_type == "string" then
+    return string.format("%q", value)
+  elseif value_type == "number" or value_type == "boolean" then
+    return tostring(value)
+  elseif value_type == "table" then
+    local next_indent = indent .. "    "
+    local lines = { "{" }
+
+    if is_array(value) then
+      for _, item in ipairs(value) do
+        table.insert(lines, next_indent .. ConfigurationManager.serialize_lua_value(item, next_indent) .. ",")
+      end
+    else
+      local keys = {}
+      for key, _ in pairs(value) do
+        table.insert(keys, key)
+      end
+      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+      for _, key in ipairs(keys) do
+        local key_text
+        if ConfigurationManager.is_lua_identifier(key) then
+          key_text = key
+        else
+          key_text = "[" .. ConfigurationManager.serialize_lua_value(key, next_indent) .. "]"
+        end
+        table.insert(lines, next_indent .. key_text .. " = " .. ConfigurationManager.serialize_lua_value(value[key], next_indent) .. ",")
+      end
+    end
+
+    table.insert(lines, indent .. "}")
+    return table.concat(lines, "\n")
+  elseif value == nil then
+    return "nil"
+  end
+
+  return "nil"
+end
+
+function ConfigurationManager.serialize_configuration(configuration)
+  local lines = { "local CONFIGURATION = {" }
+  local written = {}
+
+  local function write_key(key)
+    if configuration[key] ~= nil then
+      local key_text
+      if ConfigurationManager.is_lua_identifier(key) then
+        key_text = key
+      else
+        key_text = "[" .. ConfigurationManager.serialize_lua_value(key, "    ") .. "]"
+      end
+      table.insert(lines, "    " .. key_text .. " = " .. ConfigurationManager.serialize_lua_value(configuration[key], "    ") .. ",")
+      written[key] = true
+    end
+  end
+
+  for _, key in ipairs(ConfigurationManager.CORE_CONFIGURATION_KEYS) do
+    write_key(key)
+  end
+
+  local keys = {}
+  for key, _ in pairs(configuration) do
+    if not written[key] and not ConfigurationManager.DEPRECATED_CONFIGURATION_KEYS[key] then
+      table.insert(keys, key)
+    end
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+  for _, key in ipairs(keys) do
+    write_key(key)
+  end
+
+  table.insert(lines, "}")
+  table.insert(lines, "")
+  table.insert(lines, "return CONFIGURATION")
+  table.insert(lines, "")
+  return table.concat(lines, "\n")
+end
+
+function ConfigurationManager.parse_lua_literal(input)
+  local loader = loadstring or load
+  local chunk, compile_error = loader("return " .. tostring(input or ""))
+  if not chunk then
+    return nil, compile_error
+  end
+
+  local ok, value = pcall(chunk)
+  if not ok then
+    return nil, value
+  end
+  return value
+end
+
+function ConfigurationManager.display_value(key, value)
+  if (key == "word_sense_model" or key == "dictionary_model" or key == "explain_model")
+      and (value == nil or value == "") then
+    return "Use default text model"
+  end
+  if type(key) == "string" and key:match("_reasoning_effort$") and (value == nil or value == "") then
+    return "Use provider default"
+  end
+  if value == nil then
+    return "Not set"
+  end
+  if type(value) == "string" and value:match("%S") == nil then
+    return "Not set"
+  end
+  if key == "api_key" and type(value) == "string" and value ~= "" then
+    if #value <= 10 then
+      return "set"
+    end
+    return value:sub(1, 6) .. "..." .. value:sub(-4)
+  end
+  if type(value) == "table" then
+    return ConfigurationManager.serialize_lua_value(value):gsub("\n", " ")
+  end
+  return tostring(value)
+end
+
+function ConfigurationManager.save(plugin, configuration)
+  local configuration_path = ConfigurationManager.get_configuration_path(plugin)
+  local file, err = io.open(configuration_path, "w")
+  if not file then
+    return false, err
+  end
+
+  file:write(ConfigurationManager.serialize_configuration(configuration))
+  file:close()
+  package.loaded["configuration"] = nil
+  return true
+end
+
+return ConfigurationManager

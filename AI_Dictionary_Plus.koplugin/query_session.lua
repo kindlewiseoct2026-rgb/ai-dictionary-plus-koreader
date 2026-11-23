@@ -1,0 +1,482 @@
+local UIManager = require("ui/uimanager")
+
+local AIViewer = require("ai_viewer")
+local AnswerFormatter = require("answer_formatter")
+local BackgroundWorker = require("background_worker")
+local Context = require("context")
+local Config = require("configuration_manager")
+local ErrorBoundary = require("error_boundary")
+local RecursiveLookup = require("recursive_lookup")
+local queryAI = require("ai_query")
+local WikipediaImage = require("wikipedia_image")
+
+local QuerySession = {}
+
+local STREAM_UPDATE_TOKEN_INTERVAL = 10
+local ONLINE_WAIT_MESSAGE = "Getting the answer..."
+
+local function output_language_suffix()
+  if Config.is_english_output() then return "" end
+  local language = Config.get_output_language()
+  return "\n\nWrite the user-visible answer in " .. language .. ". " ..
+      "Keep machine-readable metadata, the exact English Wikipedia article title, formatting markers, " ..
+      "and required dictionary section labels exactly as specified. Translate only the user-visible content."
+end
+
+local state = {
+  last_query = "",
+  last_preface_with_selection = false,
+  last_display_selection = "",
+  last_feature = "dictionary",
+  last_is_report = false,
+  last_is_dictionary = false,
+  last_image_protocol = false,
+}
+
+local function repaint_now()
+  if UIManager.forceRePaint then
+    pcall(function() UIManager:forceRePaint() end)
+  end
+  if UIManager.yieldToEPDC then
+    pcall(function() UIManager:yieldToEPDC() end)
+  end
+end
+
+local function close_selection_highlight(ui, keep_highlight)
+  if ui and ui.highlight and type(ui.highlight.onClose) == "function" then
+    ui.highlight:onClose(keep_highlight)
+  end
+end
+
+local function resolve_query(query, replacements)
+  local resolved_query = query
+  for key, value in pairs(replacements) do
+    resolved_query = resolved_query:gsub(key, value)
+  end
+  return resolved_query
+end
+
+function QuerySession.stream_answer(chatgpt_viewer, message_history, is_dictionary, display_selection, preface_with_selection, on_success, feature, on_complete, debug_prompt, session)
+  local current_viewer = chatgpt_viewer
+  local last_rendered_token_count = 0
+  local last_rendered_dictionary_boundary = 0
+  local last_rendered_answer = nil
+  local cancel_stream
+
+  current_viewer.user_scroll_enabled = false
+
+  local function refresh_current_viewer()
+    if session and session.cancelled then return end
+    -- Images belong to their entry even while it is off screen. Never rebuild
+    -- a hidden answer or interrupt the recursive-selection confirmation.
+    local viewer = current_viewer
+    if session then viewer = session.current_viewer end
+    if not viewer or viewer:isTextLookupPending() then return end
+    current_viewer = viewer:update(viewer.text, nil, { user_scroll_enabled = viewer.user_scroll_enabled })
+    current_viewer.stream_cancel = not (session and session.stream_finished) and cancel_stream or nil
+    if session then session.current_viewer = current_viewer end
+    repaint_now()
+  end
+
+  local function schedule_wikipedia_image(title)
+    if not session or session.image_lookup_scheduled or not title then return end
+    session.image_lookup_scheduled = true
+    local placeholder = WikipediaImage.new_placeholder(title, true)
+    -- Decode the bundled fallback before starting the asynchronous lookup.
+    -- On some devices, waiting until an error callback to decode it can leave
+    -- the already-reserved image area blank if that callback itself fails.
+    local no_image_placeholder =
+        WikipediaImage.from_file(session.no_image_placeholder_path, title)
+    local lookup_finished = false
+
+    local function release_no_image_placeholder()
+      WikipediaImage.free(no_image_placeholder)
+      no_image_placeholder = nil
+    end
+
+    session.image_descriptor = placeholder
+    session.current_viewer.images = { placeholder }
+    refresh_current_viewer()
+
+    local image_data = nil
+    local function finish_image_lookup()
+      if lookup_finished then return end
+      lookup_finished = true
+      session.image_lookup_cancel = nil
+      if session.cancelled then
+        release_no_image_placeholder()
+        image_data = nil
+        return
+      end
+      local image = image_data and WikipediaImage.from_data(image_data, title) or nil
+      image_data = nil
+      local is_placeholder = false
+      if not image then
+        is_placeholder = true
+        image = no_image_placeholder
+        no_image_placeholder = nil
+        -- Retry once in case the eager decode failed for a transient reason.
+        if not image then
+          image = WikipediaImage.from_file(session.no_image_placeholder_path, title)
+        end
+        if not image then
+          -- Keep the outlined loading descriptor instead of clearing it into
+          -- an entirely blank reserved area.
+          refresh_current_viewer()
+          return
+        end
+      else
+        release_no_image_placeholder()
+      end
+      local old_bb = placeholder.bb
+      placeholder.bb = image.bb
+      placeholder.hi_bb = image.hi_bb
+      placeholder.hi_width = image.hi_width
+      placeholder.hi_height = image.hi_height
+      -- TextBoxWidget may adjust descriptor dimensions during an earlier
+      -- placeholder layout. Restore them to the final bitmap's exact bounds.
+      placeholder.width = image.width
+      placeholder.height = image.height
+      placeholder.title = image.title
+      placeholder.is_placeholder = is_placeholder
+      if old_bb and old_bb.free then old_bb:free() end
+      refresh_current_viewer()
+    end
+
+    local cancel_background_lookup = BackgroundWorker.start(function(emit)
+      local data = WikipediaImage.download(title)
+      if data then emit(data) end
+    end, {
+      on_message = function(data)
+        if not session.cancelled then image_data = data end
+      end,
+      on_complete = ErrorBoundary.wrap("finish Wikipedia image lookup", finish_image_lookup),
+      on_error = ErrorBoundary.wrap("fail Wikipedia image lookup", function()
+        finish_image_lookup()
+      end),
+    })
+    session.image_lookup_cancel = function()
+      lookup_finished = true
+      ErrorBoundary.call("cancel Wikipedia lookup", cancel_background_lookup)
+      release_no_image_placeholder()
+      image_data = nil
+    end
+  end
+
+  local function visible_response(response)
+    if not session or not session.image_protocol then
+      return response, true
+    end
+    local title, visible, complete = WikipediaImage.parse_response(response)
+    if not complete then return "", false end
+    if not session.metadata_received then
+      session.metadata_received = true
+      schedule_wikipedia_image(title)
+    end
+    return visible, true
+  end
+
+  local function update_viewer(answer, final_debug_prompt, update_options)
+    if session and session.cancelled then return end
+    last_rendered_answer = answer
+    current_viewer = AnswerFormatter.render_answer(
+      current_viewer,
+      is_dictionary,
+      display_selection,
+      preface_with_selection,
+      answer,
+      final_debug_prompt,
+      update_options
+    )
+    current_viewer.stream_cancel = cancel_stream
+    if session then
+      session.current_viewer = current_viewer
+    end
+    repaint_now()
+  end
+
+  cancel_stream = queryAI(message_history, {
+    feature = feature or (is_dictionary and "dictionary" or "explain"),
+    on_delta = function(_, accumulated, token_count)
+      if session and (session.cancelled or session.stream_finished) then return end
+      local visible, metadata_complete = visible_response(accumulated)
+      if not metadata_complete then return end
+      if is_dictionary then
+        local boundary = AnswerFormatter.find_dictionary_section_boundary(visible, last_rendered_dictionary_boundary)
+        if boundary then
+          last_rendered_dictionary_boundary = boundary
+          local partial_answer = visible:sub(1, boundary - 1):gsub("%s+$", "")
+          update_viewer(partial_answer, nil, {
+            user_scroll_enabled = false,
+            on_deep_dive = false,
+            text_lookup_enabled = false,
+          })
+        end
+      elseif token_count - last_rendered_token_count >= STREAM_UPDATE_TOKEN_INTERVAL then
+        last_rendered_token_count = token_count
+        update_viewer(visible, nil, {
+          user_scroll_enabled = false,
+          on_deep_dive = false,
+          text_lookup_enabled = false,
+        })
+      end
+    end,
+    on_done = function(accumulated)
+      if session and (session.cancelled or session.stream_finished) then return end
+      local visible, metadata_complete = visible_response(accumulated)
+      if not metadata_complete then
+        visible = WikipediaImage.strip_metadata_fallback(accumulated)
+      end
+      if visible ~= last_rendered_answer or debug_prompt then
+        update_viewer(visible, debug_prompt, {
+          user_scroll_enabled = true,
+          on_deep_dive = session and session.deep_dive_callback or false,
+          deep_dive_focus = session and session.deep_dive_focus or false,
+          text_lookup_enabled = session and session.text_lookup_callback ~= nil or false,
+        })
+      else
+        current_viewer.user_scroll_enabled = true
+        current_viewer.onDeepDive = session and session.deep_dive_callback or false
+        current_viewer.deep_dive_focus = session and session.deep_dive_focus or false
+        current_viewer.text_lookup_enabled = session and session.text_lookup_callback ~= nil or false
+      end
+      if on_success then
+        on_success(visible)
+      end
+      current_viewer.stream_cancel = nil
+      if session then
+        session.stream_finished = true
+        session.stream_cancel = nil
+      end
+      if on_complete then
+        on_complete()
+      end
+    end,
+    on_error = function(err)
+      if session and (session.cancelled or session.stream_finished) then return end
+      update_viewer("Error querying AI: " .. tostring(err), nil, {
+        user_scroll_enabled = true,
+        on_deep_dive = false,
+        text_lookup_enabled = false,
+      })
+      current_viewer.stream_cancel = nil
+      if session then
+        session.stream_finished = true
+        session.stream_cancel = nil
+      end
+      if on_complete then
+        on_complete()
+      end
+    end,
+  })
+
+  current_viewer.stream_cancel = not (session and session.stream_finished) and cancel_stream or nil
+  if session then
+    session.stream_cancel = current_viewer.stream_cancel
+    session.current_viewer = current_viewer
+  end
+end
+
+function QuerySession.stream_plain_answer(chatgpt_viewer, message_history, on_complete)
+  local current_viewer = chatgpt_viewer
+  local last_rendered_token_count = 0
+  local last_rendered_answer = nil
+  local cancel_stream
+
+  current_viewer.user_scroll_enabled = false
+
+  local function update_viewer(answer, update_options)
+    last_rendered_answer = answer
+    current_viewer = current_viewer:update(answer, nil, update_options)
+    current_viewer.stream_cancel = cancel_stream
+    repaint_now()
+  end
+
+  cancel_stream = queryAI(message_history, {
+    feature = "explain",
+    on_delta = function(_, accumulated, token_count)
+      if token_count - last_rendered_token_count >= STREAM_UPDATE_TOKEN_INTERVAL then
+        last_rendered_token_count = token_count
+        update_viewer(accumulated, { user_scroll_enabled = false })
+      end
+    end,
+    on_done = function(accumulated)
+      if accumulated ~= last_rendered_answer then
+        update_viewer(accumulated, { user_scroll_enabled = true })
+      else
+        current_viewer.user_scroll_enabled = true
+      end
+      if on_complete then
+        on_complete()
+      end
+    end,
+    on_error = function(err)
+      update_viewer("Error querying AI: " .. tostring(err), { user_scroll_enabled = true })
+      if on_complete then
+        on_complete()
+      end
+    end,
+  })
+
+  current_viewer.stream_cancel = cancel_stream
+end
+
+function QuerySession.query(plugin, reader_highlight_instance, dialog_title, preface_with_selection, query)
+  local ui = plugin.ui
+  local context = Context.build_query_context(plugin, reader_highlight_instance, dialog_title)
+  local query_text = resolve_query(query, context.replacements)
+  close_selection_highlight(ui, true)
+  if dialog_title == "AI Dictionary" or dialog_title == "AI Explain" then
+    return RecursiveLookup.start {
+      plugin = plugin,
+      context = context,
+      title = dialog_title,
+      is_dictionary = dialog_title == "AI Dictionary",
+      image_protocol = Config.is_images_enabled(),
+      query_text = query_text,
+      language_suffix = output_language_suffix(),
+      feature = dialog_title == "AI Dictionary" and "dictionary" or "explain",
+      stream_answer = QuerySession.stream_answer,
+    }
+  end
+
+  local session = { cancelled = false }
+  local chatgpt_viewer = AIViewer:new {
+    title = dialog_title,
+    text = ONLINE_WAIT_MESSAGE,
+    benedict = plugin,
+    lookup_session = session,
+    user_scroll_enabled = false,
+    bottom_sheet = true,
+    bottom_sheet_position = context.viewer_position,
+    bottom_sheet_selection_bounds = context.selection_bounds,
+    close_callback = ErrorBoundary.wrap("close lookup session", function()
+      session.cancelled = true
+      close_selection_highlight(ui)
+    end),
+  }
+  session.current_viewer = chatgpt_viewer
+  chatgpt_viewer.auxiliary_cancel = ErrorBoundary.wrap("cancel lookup session", function()
+    session.cancelled = true
+    if session.query_start_action then UIManager:unschedule(session.query_start_action) end
+    session.current_viewer = nil
+  end)
+  UIManager:show(chatgpt_viewer)
+
+  state.last_query = query_text
+  state.last_preface_with_selection = preface_with_selection
+  state.last_display_selection = context.display_selection
+  state.last_feature = "dictionary"
+  state.last_is_report = false
+  state.last_is_dictionary = false
+  state.last_image_protocol = false
+
+  session.message_history = { { role = "user", content = query_text } }
+  session.query_start_action = ErrorBoundary.wrap("start query stream", function()
+    session.query_start_action = nil
+    if session.cancelled then return end
+    QuerySession.stream_answer(chatgpt_viewer, session.message_history, false,
+      context.display_selection, preface_with_selection, nil, "dictionary", nil,
+      Config.is_debug_mode_enabled() and query_text or nil, session)
+  end)
+  UIManager:scheduleIn(0.01, session.query_start_action)
+end
+
+function QuerySession.start_report(report_viewer, report_prompt)
+  state.last_query = report_prompt
+  state.last_preface_with_selection = false
+  state.last_display_selection = ""
+  state.last_feature = "explain"
+  state.last_is_dictionary = false
+  state.last_is_report = true
+  state.last_image_protocol = false
+
+  local message_history = {
+    {
+      role = "user",
+      content = report_prompt,
+    },
+  }
+
+  QuerySession.stream_plain_answer(report_viewer, message_history)
+end
+
+function QuerySession.regenerate(plugin, chatgpt_viewer)
+  if chatgpt_viewer.lookup_session and chatgpt_viewer.lookup_session.regenerate then
+    return chatgpt_viewer.lookup_session.regenerate()
+  end
+  local session = chatgpt_viewer.lookup_session
+  if chatgpt_viewer.stream_cancel then
+    chatgpt_viewer.stream_cancel()
+    chatgpt_viewer.stream_cancel = nil
+  end
+  if chatgpt_viewer.auxiliary_cancel then
+    chatgpt_viewer.auxiliary_cancel()
+    chatgpt_viewer.auxiliary_cancel = nil
+  end
+  local old_images = chatgpt_viewer.images
+  chatgpt_viewer.images = nil
+  local updated_viewer = chatgpt_viewer:update(ONLINE_WAIT_MESSAGE, nil, {
+    user_scroll_enabled = false,
+    text_lookup_enabled = false,
+  })
+  WikipediaImage.free(old_images and old_images[1])
+
+  if session then
+    session.cancelled = false
+    session.stream_finished = false
+    session.image_protocol = state.last_image_protocol
+    session.current_viewer = updated_viewer
+    session.image_descriptor = nil
+    session.image_lookup_scheduled = false
+    session.metadata_received = false
+  else
+    session = {
+      cancelled = false,
+      image_protocol = state.last_image_protocol,
+      current_viewer = updated_viewer,
+      text_lookup_callback = updated_viewer.text_selection_callback,
+      no_image_placeholder_path = plugin.path .. "/Resources/no-image-placeholder.jpg",
+      plugin_path = plugin.path,
+    }
+  end
+  updated_viewer.lookup_session = session
+  updated_viewer.auxiliary_cancel = ErrorBoundary.wrap("cancel regenerated session", function()
+    session.cancelled = true
+    if session.query_start_action then UIManager:unschedule(session.query_start_action) end
+    if session.image_lookup_cancel then session.image_lookup_cancel() end
+    session.image_lookup_cancel = nil
+    WikipediaImage.free(session.image_descriptor)
+  end)
+
+  session.query_start_action = ErrorBoundary.wrap("start regenerated query stream", function()
+    session.query_start_action = nil
+    if session.cancelled then return end
+    local message_history = {
+      {
+        role = "user",
+        content = state.last_query,
+      },
+    }
+
+    if state.last_is_report then
+      QuerySession.stream_plain_answer(updated_viewer, message_history)
+    else
+      QuerySession.stream_answer(
+        updated_viewer,
+        message_history,
+        state.last_is_dictionary,
+        state.last_display_selection,
+        state.last_preface_with_selection,
+        nil,
+        state.last_feature,
+        nil,
+        Config.is_debug_mode_enabled() and state.last_query or nil,
+        session
+      )
+    end
+  end)
+  UIManager:scheduleIn(0.01, session.query_start_action)
+end
+
+return QuerySession

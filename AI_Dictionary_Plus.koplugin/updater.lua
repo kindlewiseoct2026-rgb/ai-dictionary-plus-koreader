@@ -1,0 +1,511 @@
+local ButtonDialog = require("ui/widget/buttondialog")
+local ConfirmBox = require("ui/widget/confirmbox")
+local InfoMessage = require("ui/widget/infomessage")
+local NetworkMgr = require("ui/network/manager")
+local UIManager = require("ui/uimanager")
+local http = require("socket.http")
+local https = require("ssl.https")
+local json = require("json")
+local lfs = require("libs/libkoreader-lfs")
+local ltn12 = require("ltn12")
+local util = require("util")
+
+local ErrorBoundary = require("error_boundary")
+
+local REQUEST_TIMEOUT_SECONDS = require("constants").network.request_timeout_seconds
+local UPDATE_PROMPT_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+local LAST_UPDATE_PROMPT_INTERACTION_SETTING =
+    "ai_dictionary_last_update_prompt_interaction"
+-- Change these two values if you move or rename your GitHub repository.
+local REPO_OWNER = "kindlewiseoct2026-rgb"
+local REPO_NAME = "ai-dictionary-plus-koreader"
+local LATEST_RELEASE_URL = "https://api.github.com/repos/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/releases/latest"
+-- Folder inside the repository that holds the plugin; must match the folder name in your repo.
+local PLUGIN_DIR_NAME = "AI_Dictionary_Plus.koplugin"
+
+https.TIMEOUT = REQUEST_TIMEOUT_SECONDS
+http.TIMEOUT = REQUEST_TIMEOUT_SECONDS
+
+local Updater = {}
+
+local function show_message(text, timeout)
+  local message = InfoMessage:new {
+    text = text,
+    timeout = timeout or 3,
+  }
+  UIManager:show(message)
+  return message
+end
+
+local function path_join(...)
+  local parts = { ... }
+  local result = tostring(parts[1] or "")
+  for i = 2, #parts do
+    local part = tostring(parts[i] or "")
+    if result:sub(-1) == "/" then
+      result = result .. part:gsub("^/+", "")
+    else
+      result = result .. "/" .. part:gsub("^/+", "")
+    end
+  end
+  return result
+end
+
+local function normalize_version(version)
+  version = tostring(version or ""):gsub("^v", "")
+  local parts = {}
+  for part in version:gmatch("%d+") do
+    table.insert(parts, tonumber(part) or 0)
+  end
+  return parts
+end
+
+local function compare_versions(left, right)
+  local left_parts = normalize_version(left)
+  local right_parts = normalize_version(right)
+  local length = math.max(#left_parts, #right_parts)
+  for i = 1, length do
+    local left_part = left_parts[i] or 0
+    local right_part = right_parts[i] or 0
+    if left_part < right_part then
+      return -1
+    elseif left_part > right_part then
+      return 1
+    end
+  end
+  return 0
+end
+
+local function get_current_version(plugin_dir)
+  local meta_path = path_join(plugin_dir, "_meta.lua")
+  local file = io.open(meta_path, "r")
+  if file then
+    local contents = file:read("*all")
+    file:close()
+
+    local quoted_version = contents:match("version%s*=%s*[\"']([^\"']+)[\"']")
+    if quoted_version then
+      return quoted_version
+    end
+
+    local numeric_version = contents:match("version%s*=%s*([%d%.]+)")
+    if numeric_version then
+      return numeric_version
+    end
+  end
+
+  package.loaded["_meta"] = nil
+  local ok, meta = pcall(function() return require("_meta") end)
+  if ok and meta and meta.version then
+    return tostring(meta.version)
+  end
+  return "0"
+end
+
+local function http_get(url)
+  local response = {}
+  local ok, code = https.request {
+    url = url,
+    method = "GET",
+    headers = {
+      ["Accept"] = "application/vnd.github+json",
+      ["User-Agent"] = "AI-Dictionary-Plus-KOReader",
+    },
+    sink = ltn12.sink.table(response),
+  }
+
+  if tostring(code) ~= "200" then
+    return nil, "HTTP " .. tostring(code) .. " from " .. url
+  end
+
+  return table.concat(response)
+end
+
+local function download_file(url, destination)
+  local file, err = io.open(destination, "wb")
+  if not file then
+    return nil, err
+  end
+
+  local ok, code = https.request {
+    url = url,
+    method = "GET",
+    headers = {
+      ["Accept"] = "application/zip",
+      ["User-Agent"] = "AI-Dictionary-Plus-KOReader",
+    },
+    sink = ltn12.sink.file(file),
+  }
+
+  if tostring(code) ~= "200" then
+    os.remove(destination)
+    return nil, "HTTP " .. tostring(code) .. " while downloading update"
+  end
+
+  return true
+end
+
+local function shell_escape(path)
+  if util.shell_escape then
+    return util.shell_escape({ path })
+  end
+  return "'" .. tostring(path):gsub("'", "'\\''") .. "'"
+end
+
+local function run_command(command)
+  local result = os.execute(command)
+  if result == true or result == 0 then
+    return true
+  end
+  return nil, "Command failed: " .. command
+end
+
+local function remove_tree(path)
+  if not path or path == "" or path == "/" then
+    return nil, "Refusing to remove unsafe path"
+  end
+  return run_command("rm -rf " .. shell_escape(path))
+end
+
+local function copy_file(source, destination)
+  local input, input_err = io.open(source, "rb")
+  if not input then
+    return nil, input_err
+  end
+
+  local output, output_err = io.open(destination, "wb")
+  if not output then
+    input:close()
+    return nil, output_err
+  end
+
+  while true do
+    local chunk = input:read(8192)
+    if not chunk then
+      break
+    end
+    output:write(chunk)
+  end
+
+  input:close()
+  output:close()
+  return true
+end
+
+local function relative_path(base, path)
+  return path:sub(#base + 2)
+end
+
+local function is_preserved_config(relative)
+  return relative == "configuration.lua"
+      or relative:match("/configuration%.lua$") ~= nil
+end
+
+local function is_preserved_user_data(relative)
+  return relative == "Lookups" or relative:match("^Lookups/") ~= nil
+      or relative == "word_sense" or relative:match("^word_sense/") ~= nil
+end
+
+local function is_updater_temp(relative)
+  return relative:match("^%.update%-") ~= nil
+end
+
+local function find_extracted_plugin_dir(root)
+  local found
+  util.findFiles(root, function(path)
+    if path:match("/" .. PLUGIN_DIR_NAME .. "/_meta%.lua$") then
+      found = path:match("^(.*)/_meta%.lua$")
+    end
+  end, true)
+  return found
+end
+
+local function ensure_parent_dir(path)
+  local parent = path:match("^(.*)/[^/]+$")
+  if parent and parent ~= "" then
+    return util.makePath(parent)
+  end
+  return true
+end
+
+local function collect_files(root)
+  local files = {}
+  util.findFiles(root, function(path)
+    files[relative_path(root, path)] = path
+  end, true)
+  return files
+end
+
+local function prune_empty_dirs(root)
+  local dirs = {}
+  local function scan(dir)
+    local ok, iter, dir_obj = pcall(lfs.dir, dir)
+    if not ok then
+      return
+    end
+    for name in iter, dir_obj do
+      if name ~= "." and name ~= ".." then
+        local path = path_join(dir, name)
+        if lfs.attributes(path, "mode") == "directory" then
+          scan(path)
+          table.insert(dirs, path)
+        end
+      end
+    end
+  end
+
+  scan(root)
+  table.sort(dirs, function(a, b) return #a > #b end)
+  for _, dir in ipairs(dirs) do
+    local relative = relative_path(root, dir)
+    pcall(function()
+      if not is_preserved_user_data(relative) and not is_updater_temp(relative) and util.isEmptyDir(dir) then
+        lfs.rmdir(dir)
+      end
+    end)
+  end
+end
+
+local function apply_update(plugin_dir, extracted_plugin_dir)
+  local new_files = collect_files(extracted_plugin_dir)
+  local old_files = collect_files(plugin_dir)
+
+  for relative, old_path in pairs(old_files) do
+    if not new_files[relative]
+        and not is_preserved_config(relative)
+        and not is_preserved_user_data(relative)
+        and not is_updater_temp(relative) then
+      os.remove(old_path)
+    end
+  end
+
+  for relative, source_path in pairs(new_files) do
+    if not is_preserved_config(relative) and not is_preserved_user_data(relative) then
+      local destination = path_join(plugin_dir, relative)
+      local ok, err = ensure_parent_dir(destination)
+      if not ok then
+        return nil, err
+      end
+
+      ok, err = copy_file(source_path, destination)
+      if not ok then
+        return nil, err
+      end
+    end
+  end
+
+  prune_empty_dirs(plugin_dir)
+  return true
+end
+
+local function get_latest_release()
+  local body, err = http_get(LATEST_RELEASE_URL)
+  if not body then
+    return nil, err
+  end
+
+  local ok, release = pcall(function() return json.decode(body) end)
+  if not ok or type(release) ~= "table" then
+    return nil, "Could not parse latest release response"
+  end
+
+  if not release.tag_name then
+    return nil, "Latest release has no tag_name"
+  end
+
+  return release
+end
+
+function Updater:new(plugin)
+  return setmetatable({
+    plugin = plugin,
+    checked = false,
+    check_in_progress = false,
+  }, { __index = self })
+end
+
+function Updater:getPluginDir()
+  if self.plugin and self.plugin.path and self.plugin.path ~= "" then
+    return self.plugin.path
+  end
+  return PLUGIN_DIR_NAME
+end
+
+function Updater:isStartupCheckCoolingDown(now)
+  if not G_reader_settings or type(G_reader_settings.readSetting) ~= "function" then
+    return false
+  end
+  local ok, last_interaction = pcall(
+    G_reader_settings.readSetting,
+    G_reader_settings,
+    LAST_UPDATE_PROMPT_INTERACTION_SETTING
+  )
+  last_interaction = ok and tonumber(last_interaction) or nil
+  now = tonumber(now) or os.time()
+  if not last_interaction or last_interaction > now then
+    return false
+  end
+  return now - last_interaction < UPDATE_PROMPT_COOLDOWN_SECONDS
+end
+
+function Updater:markUpdatePromptInteracted(now)
+  if not G_reader_settings or type(G_reader_settings.saveSetting) ~= "function" then
+    return
+  end
+  G_reader_settings:saveSetting(
+    LAST_UPDATE_PROMPT_INTERACTION_SETTING,
+    tonumber(now) or os.time()
+  )
+  if type(G_reader_settings.flush) == "function" then
+    G_reader_settings:flush()
+  end
+end
+
+function Updater:performCheck(manual)
+  local release, err = get_latest_release()
+  if not release then
+    if manual then
+      show_message("Could not check for AI Dictionary Plus updates:\n" .. tostring(err), 8)
+    end
+    return
+  end
+
+  local current_version = get_current_version(self:getPluginDir())
+  local latest_version = tostring(release.tag_name):gsub("^v", "")
+  if compare_versions(current_version, latest_version) >= 0 then
+    if manual then
+      show_message("AI Dictionary Plus is up to date.")
+    end
+    return
+  end
+
+  self:promptForUpdate(current_version, latest_version, release.tag_name)
+end
+
+function Updater:scheduleCheck(delay, manual)
+  if self.check_in_progress then
+    if manual then
+      show_message("An AI Dictionary Plus update check is already in progress.")
+    end
+    return
+  end
+  if not NetworkMgr:isOnline() then
+    if manual then
+      show_message("Could not check for updates while offline.")
+    end
+    return
+  end
+
+  self.check_in_progress = true
+  UIManager:scheduleIn(delay or 0, function()
+    local _, err = ErrorBoundary.call(
+      manual and "manual update check" or "startup update check",
+      self.performCheck,
+      self,
+      manual
+    )
+    self.check_in_progress = false
+    if err and manual then
+      show_message("Could not check for AI Dictionary Plus updates:\n" .. tostring(err), 8)
+    end
+  end)
+end
+
+function Updater:checkOnStartup()
+  if self.checked then return end
+  self.checked = true
+  if self:isStartupCheckCoolingDown() then return end
+  self:scheduleCheck(2, false)
+end
+
+function Updater:checkManually()
+  self:scheduleCheck(0, true)
+end
+
+function Updater:promptForUpdate(current_version, latest_version, tag_name)
+  local function mark_interacted()
+    ErrorBoundary.call("save update prompt interaction", self.markUpdatePromptInteracted, self)
+  end
+  UIManager:show(ConfirmBox:new {
+    text = "AI Dictionary Plus " .. latest_version .. " is available.\n\nInstalled version: "
+        .. tostring(current_version) .. "\n\nUpdate now?",
+    ok_text = "Update",
+    ok_callback = ErrorBoundary.wrap("start plugin update", function()
+      mark_interacted()
+      local updating_message = show_message("Updating AI Dictionary Plus...", 2)
+      UIManager:scheduleIn(0.1, ErrorBoundary.wrap("plugin update", function()
+        local ok, err = ErrorBoundary.call(
+          "apply plugin update",
+          self.updateToTag,
+          self,
+          tag_name
+        )
+        UIManager:close(updating_message)
+        if ok then
+          self:showRestartDialog()
+        else
+          show_message("AI Dictionary Plus update failed:\n" .. tostring(err), 8)
+        end
+      end))
+    end),
+    cancel_callback = mark_interacted,
+  })
+end
+
+function Updater:updateToTag(tag_name)
+  local plugin_dir = self:getPluginDir()
+  local tmp_root = path_join(plugin_dir, ".update-" .. tostring(os.time()))
+  local extract_dir = path_join(tmp_root, "extract")
+  local zip_path = path_join(tmp_root, "release.zip")
+  local zip_url = "https://codeload.github.com/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/zip/refs/tags/" .. tostring(tag_name)
+
+  local ok, err = util.makePath(extract_dir)
+  if not ok then
+    return nil, err
+  end
+
+  ok, err = download_file(zip_url, zip_path)
+  if not ok then
+    remove_tree(tmp_root)
+    return nil, err
+  end
+
+  ok, err = run_command("unzip -q " .. shell_escape(zip_path) .. " -d " .. shell_escape(extract_dir))
+  if not ok then
+    remove_tree(tmp_root)
+    return nil, err .. "\nThe device may not have the unzip command."
+  end
+
+  local extracted_plugin_dir = find_extracted_plugin_dir(extract_dir)
+  if not extracted_plugin_dir then
+    remove_tree(tmp_root)
+    return nil, "Could not find " .. PLUGIN_DIR_NAME .. " in release archive"
+  end
+
+  ok, err = apply_update(plugin_dir, extracted_plugin_dir)
+  remove_tree(tmp_root)
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+function Updater:showRestartDialog()
+  UIManager:show(ButtonDialog:new {
+    title = "AI Dictionary Plus was updated.\n\nPlease quit and restart KOReader to load the new version.",
+    dismissable = false,
+    buttons = {
+      {
+        {
+          text = "Quit",
+          callback = function()
+            UIManager:quit()
+          end,
+        },
+      },
+    },
+  })
+end
+
+return Updater
